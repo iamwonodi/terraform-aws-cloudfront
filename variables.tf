@@ -315,6 +315,106 @@ variable "ordered_cache_behaviors" {
   }
 }
 
+
+###################################################################################
+# CUSTOM ERROR RESPONSES
+###################################################################################
+
+variable "custom_error_responses" {
+  type = list(object({
+    error_code            = number
+    response_code         = optional(number)
+    response_page_path    = optional(string)
+    error_caching_min_ttl = optional(number)
+  }))
+
+  description = <<-EOT
+    Custom error responses returned by CloudFront when the configured origin
+    returns an HTTP error status code.
+
+    Each object may define:
+      - error_code: The HTTP error status code CloudFront should intercept.
+      - response_code: The HTTP status code returned to the viewer.
+      - response_page_path: The path to the custom error page.
+      - error_caching_min_ttl: Minimum amount of time, in seconds, that CloudFront
+        caches the error response.
+
+    Example:
+      [
+        {
+          error_code            = 404
+          response_code         = 404
+          response_page_path    = "/errors/404.html"
+          error_caching_min_ttl = 60
+        }
+      ]
+
+    When response_code or response_page_path is omitted, CloudFront uses its
+    default behavior for that attribute.
+  EOT
+
+  default = []
+
+  validation {
+    condition = alltrue([
+      for error in var.custom_error_responses :
+      contains(
+        [
+          400, 401, 403, 404, 405, 406, 407, 408, 409, 410,
+          411, 412, 413, 414, 415, 416, 417, 418, 421, 422,
+          423, 424, 425, 426, 428, 429, 431, 451,
+          500, 501, 502, 503, 504, 505, 506, 507, 508, 509,
+          510, 511
+        ],
+        error.error_code
+      )
+    ])
+
+    error_message = "Each custom error response must use a supported HTTP error status code."
+  }
+
+  validation {
+    condition = alltrue([
+      for error in var.custom_error_responses :
+      error.error_caching_min_ttl == null ||
+      error.error_caching_min_ttl >= 0
+    ])
+
+    error_message = "error_caching_min_ttl must be greater than or equal to 0."
+  }
+
+  validation {
+    condition = alltrue([
+      for error in var.custom_error_responses :
+      error.response_code == null ||
+      contains(
+        [
+          200, 201, 202, 203, 204, 205, 206,
+          300, 301, 302, 303, 304, 307, 308,
+          400, 401, 403, 404, 405, 406, 407, 408, 409, 410,
+          411, 412, 413, 414, 415, 416, 417, 418, 421, 422,
+          423, 424, 425, 426, 428, 429, 431, 451,
+          500, 501, 502, 503, 504, 505, 506, 507, 508,
+          509, 510, 511
+        ],
+        error.response_code
+      )
+    ])
+
+    error_message = "response_code must be a valid HTTP response status code."
+  }
+
+  validation {
+    condition = alltrue([
+      for error in var.custom_error_responses :
+      error.response_page_path == null ||
+      startswith(error.response_page_path, "/")
+    ])
+
+    error_message = "response_page_path must begin with '/'."
+  }
+}
+
 variable "origin_groups" {
   type = map(object({
     primary_origin_id     = string

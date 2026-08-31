@@ -11,11 +11,11 @@ module "cloudfront" {
 
   # ---------------------------------------------------------------------------
   # Two independent origins demonstrate the primary reason for supporting
-  # multiple CloudFront origins: static content can use S3 while application
+  # multiple CloudFront origins: static, Media & Error content can use S3 while application
   # traffic is routed to an ALB/custom HTTP origin.
   # ---------------------------------------------------------------------------
   origins = {
-    static = {
+    s3 = {
       domain_name = var.s3_origin_domain_name
       origin_type = "s3"
 
@@ -45,11 +45,57 @@ module "cloudfront" {
     target_origin_id = "application"
   }
 
-  # Static content is routed independently to S3.
+  # Static, Media & Error content is routed independently to S3.
   ordered_cache_behaviors = [
     {
       path_pattern     = "/static/*"
-      target_origin_id = "static"
+      target_origin_id = "s3"
+    },
+    {
+      path_pattern     = "/media/*"
+      target_origin_id = "s3"
+    },
+    {
+      path_pattern     = "/errors/*"
+      target_origin_id = "s3"
+    },
+  ]
+
+
+  #################################################################################
+  # CUSTOM ERROR RESPONSES
+  #################################################################################
+
+  custom_error_responses = [
+    {
+      error_code            = 404
+      response_code         = 404
+      response_page_path    = "/errors/404.html"
+      error_caching_min_ttl = 60
+    },
+    {
+      error_code            = 500
+      response_code         = 500
+      response_page_path    = "/errors/500.html"
+      error_caching_min_ttl = 10
+    },
+    {
+      error_code            = 502
+      response_code         = 502
+      response_page_path    = "/errors/502.html"
+      error_caching_min_ttl = 10
+    },
+    {
+      error_code            = 503
+      response_code         = 503
+      response_page_path    = "/errors/503.html"
+      error_caching_min_ttl = 10
+    },
+    {
+      error_code            = 504
+      response_code         = 504
+      response_page_path    = "/errors/504.html"
+      error_caching_min_ttl = 10
     }
   ]
 

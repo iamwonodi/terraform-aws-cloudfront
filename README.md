@@ -1,6 +1,6 @@
 # Terraform AWS CloudFront Module
 
-A production-oriented Terraform module for provisioning reusable **Amazon CloudFront distributions** with support for multiple origins, path-based cache behavior routing, origin failover groups, HTTPS/custom domains, AWS WAF integration, and CloudFront **Standard Logging v2**.
+A production-oriented Terraform module for provisioning reusable **Amazon CloudFront distributions** with support for multiple origins, path-based cache behavior routing, custom error responses, origin failover groups, HTTPS/custom domains, AWS WAF integration, and CloudFront **Standard Logging v2**.
 
 The module is intentionally designed around **composition rather than infrastructure ownership**. It creates and manages the CloudFront distribution and its Standard Logging v2 delivery configuration while consuming externally managed resources such as S3 buckets, Application Load Balancers, ACM certificates, WAF Web ACLs, cache policies, origin request policies, response headers policies, and logging destinations.
 
@@ -17,6 +17,8 @@ The module is intentionally designed around **composition rather than infrastruc
 * [Usage](#usage)
 * [Multiple Origins](#multiple-origins)
 * [Cache Behaviors](#cache-behaviors)
+* [Static and Media Asset Routing](#static-and-media-asset-routing)
+* [Custom Error Responses](#custom-error-responses)
 * [Origin Groups and Failover](#origin-groups-and-failover)
 * [HTTPS and Custom Domains](#https-and-custom-domains)
 * [AWS WAF Integration](#aws-waf-integration)
@@ -34,6 +36,8 @@ The module is intentionally designed around **composition rather than infrastruc
 * [Importing Existing Resources](#importing-existing-resources)
 * [Troubleshooting](#troubleshooting)
 * [Recommended Production Pattern](#recommended-production-pattern)
+* [Design Philosophy](#design-philosophy)
+* [Versioning](#versioning)
 * [License](#license)
 
 ---
@@ -42,39 +46,41 @@ The module is intentionally designed around **composition rather than infrastruc
 
 Amazon CloudFront is an AWS content delivery network (CDN) that provides globally distributed delivery of web applications, APIs, static assets, media, and other HTTP/HTTPS content.
 
-This module provides a reusable Terraform abstraction around `aws_cloudfront_distribution`.
+This module provides a reusable Terraform abstraction around:
+
+```text
+aws_cloudfront_distribution
+```
 
 The module is designed to support architectures where a single CloudFront distribution fronts multiple backend systems.
 
-For example:
+A typical production application may use:
 
 ```text
-                         ┌──────────────────────┐
-                         │      End Users       │
-                         └──────────┬───────────┘
-                                    │
-                                    │ HTTPS
-                                    ▼
-                         ┌──────────────────────┐
-                         │      CloudFront      │
-                         │   Global Edge CDN    │
-                         └──────────┬───────────┘
-                                    │
-                   ┌────────────────┼────────────────┐
-                   │                │                │
-                   │                │                │
-                   ▼                ▼                ▼
-              /static/*          /api/*              /*
-                   │                │                │
-                   ▼                ▼                ▼
-              ┌────────┐      ┌────────┐       ┌────────┐
-              │   S3   │      │  ALB   │       │  ALB   │
-              │ Static │      │  API   │       │  App   │
-              │ Assets │      │        │       │        │
-              └────────┘      └────────┘       └────────┘
+                         Internet Users
+                              │
+                              │ HTTPS
+                              ▼
+                     ┌─────────────────┐
+                     │   CloudFront    │
+                     │   Distribution  │
+                     └────────┬────────┘
+                              │
+             ┌────────────────┼────────────────┐
+             │                │                │
+             ▼                ▼                ▼
+        /static/*         /media/*          /*
+             │                │                │
+             ▼                ▼                ▼
+            S3               S3               ALB
+        Static Assets    Media Assets    Application
+                                              │
+                                              ▼
+                                           Django
+                                           / App
 ```
 
-This allows CloudFront to act as the single public entry point while different request paths are routed to the appropriate backend.
+The distribution therefore acts as the **single public entry point** while different request paths are routed to the appropriate backend.
 
 ---
 
@@ -82,57 +88,78 @@ This allows CloudFront to act as the single public entry point while different r
 
 ## High-Level Architecture
 
+The module supports a multi-origin architecture in which CloudFront determines the destination of a request using ordered cache behaviors and a default cache behavior.
+
 ```mermaid
 flowchart TB
 
-    USERS["Internet Users"]
+    USER["Internet Users"]
+
+    WAF["AWS WAF<br/>Optional"]
 
     CF["Amazon CloudFront<br/>Distribution"]
 
-    USERS -->|HTTPS| CF
+    STATIC["/static/*"]
+    MEDIA["/media/*"]
+    ERRORS["/errors/*"]
+    DEFAULT["Default Behavior"]
 
-    CF --> STATIC["/static/*"]
-    CF --> API["/api/*"]
-    CF --> DEFAULT["Default Behavior"]
+    S3["Amazon S3<br/>Static / Media / Error Pages"]
 
-    STATIC --> S3["Amazon S3<br/>Static Content"]
-    API --> ALB_API["Application Load Balancer<br/>API"]
-    DEFAULT --> ALB_APP["Application Load Balancer<br/>Application"]
+    ALB["Application Load Balancer"]
+    APP["Application Workloads"]
 
-    S3 --> OAC["CloudFront Origin Access Control"]
+    OAC["CloudFront<br/>Origin Access Control"]
+
+    USER --> WAF
+    WAF --> CF
+
+    CF --> STATIC
+    CF --> MEDIA
+    CF --> ERRORS
+    CF --> DEFAULT
+
+    STATIC --> OAC
+    MEDIA --> OAC
+    ERRORS --> OAC
+
     OAC --> S3
 
-    CF --> WAF["AWS WAF<br/>Optional"]
-
-    CF --> LOGSOURCE["Standard Logging v2<br/>Delivery Source"]
-
-    LOGSOURCE --> DELIVERY["CloudWatch Logs<br/>Delivery"]
-
-    DELIVERY --> S3LOG["S3"]
-    DELIVERY --> CWLOG["CloudWatch Logs"]
-    DELIVERY --> FIREHOSE["Amazon Data Firehose"]
+    DEFAULT --> ALB
+    ALB --> APP
 ```
+
+The important routing rule is:
+
+```text
+/static/*  → S3
+/media/*   → S3
+/errors/*  → S3
+/*         → ALB
+```
+
+The default behavior therefore handles the application while specific asset and error-page paths are routed to S3.
 
 ---
 
 # Core Design
 
-The module follows five major principles.
+The module follows several major principles.
 
-## 1. Multiple origins
+## 1. Multiple Origins
 
-The module accepts an arbitrary map of origins.
+The module accepts a map of origins.
 
-This means a distribution can contain:
+A distribution can therefore contain:
 
 * S3 origins
-* ALB origins
+* Application Load Balancer origins
 * NLB/custom HTTP origins
 * Other supported custom HTTP origins
 
 Origins are identified using stable map keys.
 
-For example:
+Example:
 
 ```hcl
 origins = {
@@ -146,14 +173,14 @@ origins = {
 }
 ```
 
-The resulting CloudFront origin IDs are:
+The resulting logical origin IDs are:
 
 ```text
 static
 application
 ```
 
-Cache behaviors can then reference them directly:
+Cache behaviors can reference them directly:
 
 ```hcl
 target_origin_id = "static"
@@ -166,6 +193,44 @@ target_origin_id = "application"
 ```
 
 This is preferable to positional indexes because adding or removing an origin does not change the identity of the remaining origins.
+
+---
+
+## 2. Default Application Origin
+
+The default cache behavior should normally point to the application origin.
+
+For example:
+
+```hcl
+default_cache_behavior = {
+  target_origin_id = "application"
+}
+```
+
+This means:
+
+```text
+Every request
+     │
+     ▼
+CloudFront
+     │
+     ├── matches ordered behavior → specialized origin
+     │
+     └── no match → application origin
+```
+
+For a web application:
+
+```text
+/static/* → S3
+/media/*  → S3
+/errors/* → S3
+/*        → ALB
+```
+
+This is particularly useful for Django and other application frameworks where the majority of requests are dynamic application requests.
 
 ---
 
@@ -182,6 +247,12 @@ The module currently supports:
 * Default cache behavior
 * Ordered cache behaviors
 * Path-based origin routing
+* Static asset routing
+* Media asset routing
+* Custom error-page routing
+* CloudFront custom error responses
+* Configurable error caching TTLs
+* Configurable viewer-facing error status codes
 * CloudFront origin groups
 * Origin failover
 * Custom domain aliases
@@ -240,7 +311,13 @@ Defines:
 
 ### `variables.tf`
 
-Contains all user-configurable module inputs and validation rules.
+Contains:
+
+* User-configurable module inputs
+* Input types
+* Defaults
+* Validation rules
+* Custom error-response configuration
 
 ### `locals.tf`
 
@@ -254,6 +331,7 @@ Contains:
 * Origins
 * Origin groups
 * Cache behaviors
+* Custom error responses
 * Viewer configuration
 * WAF association
 * Standard Logging v2 resources
@@ -266,9 +344,12 @@ Exposes useful CloudFront and logging attributes to callers.
 
 Provides a complete reference implementation demonstrating:
 
+* Multiple origins
 * S3 origin
 * Application origin
-* Multiple cache behaviors
+* Static asset routing
+* Media asset routing
+* Custom error pages
 * HTTPS/custom domain configuration
 * WAF integration
 * Standard Logging v2
@@ -299,7 +380,7 @@ A minimal CloudFront distribution can be instantiated with one origin.
 
 ```hcl
 module "cloudfront" {
-  source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.0.0"
+  source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.1.0"
 
   comment = "Production CloudFront distribution"
 
@@ -342,20 +423,18 @@ The `target_origin_id` must reference an origin defined in `origins`.
 
 One of the primary capabilities of this module is support for multiple CloudFront origins.
 
-A common architecture is:
+A distribution can combine an ALB and S3:
 
 ```text
-                    CloudFront
-                        │
-             ┌──────────┴──────────┐
-             │                     │
-       /static/*                   /*
-             │                     │
-             ▼                     ▼
-        S3 Bucket                 ALB
+                         CloudFront
+                             │
+              ┌──────────────┴──────────────┐
+              │                             │
+          Specific Paths               Everything Else
+              │                             │
+              ▼                             ▼
+             S3                            ALB
 ```
-
-The S3 origin serves static assets while the ALB handles dynamic application traffic.
 
 Example:
 
@@ -399,7 +478,7 @@ Multiple origins become useful when combined with CloudFront cache behaviors.
 
 CloudFront has:
 
-1. A default cache behavior
+1. One default cache behavior
 2. Zero or more ordered cache behaviors
 
 The default behavior handles requests that do not match an ordered behavior.
@@ -438,7 +517,605 @@ CloudFront
           ALB
 ```
 
-This is one of the main reasons the module uses a map for `origins` and a list for `ordered_cache_behaviors`.
+This makes the default behavior the application path while ordered behaviors selectively route specialized paths.
+
+---
+
+# Static and Media Asset Routing
+
+A common production pattern for Django and other web applications is to keep static and media content in S3 while sending application requests to an ALB.
+
+The recommended routing model is:
+
+```text
+/static/*  → S3
+/media/*   → S3
+/*         → ALB
+```
+
+For example:
+
+```text
+https://example.com/static/css/site.css
+                              │
+                              ▼
+                             S3
+
+https://example.com/static/js/app.js
+                              │
+                              ▼
+                             S3
+
+https://example.com/media/uploads/image.jpg
+                              │
+                              ▼
+                             S3
+
+https://example.com/login/
+                              │
+                              ▼
+                             ALB
+
+https://example.com/api/users
+                              │
+                              ▼
+                             ALB
+
+https://example.com/dashboard/
+                              │
+                              ▼
+                             ALB
+```
+
+Example:
+
+```hcl
+ordered_cache_behaviors = [
+  {
+    path_pattern     = "/static/*"
+    target_origin_id = "static"
+
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = [
+      "GET",
+      "HEAD",
+      "OPTIONS"
+    ]
+
+    cached_methods = [
+      "GET",
+      "HEAD"
+    ]
+  },
+
+  {
+    path_pattern     = "/media/*"
+    target_origin_id = "static"
+
+    viewer_protocol_policy = "redirect-to-https"
+
+    allowed_methods = [
+      "GET",
+      "HEAD",
+      "OPTIONS"
+    ]
+
+    cached_methods = [
+      "GET",
+      "HEAD"
+    ]
+  }
+]
+```
+
+The application remains the default origin:
+
+```hcl
+default_cache_behavior = {
+  target_origin_id = "application"
+}
+```
+
+---
+
+# Custom Error Responses
+
+The module supports CloudFront **custom error responses**.
+
+This capability allows CloudFront to intercept configured HTTP errors returned by an origin and serve a custom error page instead.
+
+For example:
+
+```text
+ALB
+ │
+ │ HTTP 404
+ ▼
+CloudFront
+ │
+ │ Custom Error Response
+ ▼
+S3
+ │
+ │ /errors/404.html
+ ▼
+CloudFront
+ │
+ ▼
+User
+```
+
+This is different from ordinary cache behavior routing.
+
+Cache behaviors determine **where a request normally goes**.
+
+Custom error responses determine **what CloudFront does after an origin returns a configured error status**.
+
+---
+
+# Custom Error Page Architecture
+
+For an application using ALB and S3, the recommended architecture is:
+
+```text
+                              Internet
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │   CloudFront    │
+                         └────────┬────────┘
+                                  │
+             ┌────────────────────┼────────────────────┐
+             │                    │                    │
+             ▼                    ▼                    ▼
+        /static/*             /media/*             /*
+             │                    │                    │
+             └──────────┬─────────┘                    │
+                        │                              │
+                        ▼                              ▼
+                       S3                             ALB
+                        │                              │
+                        │                              ▼
+                        │                         Application
+                        │                              │
+                        │                         ┌────┴─────┐
+                        │                         │          │
+                        │                        2xx       4xx/5xx
+                        │                                    │
+                        │                                    ▼
+                        │                               CloudFront
+                        │                                    │
+                        │                         Custom Error Response
+                        │                                    │
+                        ▼                                    ▼
+                       S3 ◄──────────────────────── /errors/*.html
+```
+
+The S3 bucket can contain:
+
+```text
+static/
+media/
+errors/
+```
+
+For example:
+
+```text
+static/css/site.css
+static/js/app.js
+static/images/logo.svg
+
+media/uploads/profile.jpg
+media/uploads/document.pdf
+
+errors/404.html
+errors/500.html
+errors/502.html
+errors/503.html
+errors/504.html
+```
+
+S3 uses object keys rather than traditional filesystem directories. Therefore these are logical prefixes rather than folders that must be manually created as empty directories.
+
+---
+
+# Configuring Custom Error Responses
+
+The module exposes:
+
+```hcl
+custom_error_responses
+```
+
+Example:
+
+```hcl
+custom_error_responses = [
+  {
+    error_code            = 404
+    response_code         = 404
+    response_page_path    = "/errors/404.html"
+    error_caching_min_ttl = 60
+  },
+
+  {
+    error_code            = 500
+    response_code         = 500
+    response_page_path    = "/errors/500.html"
+    error_caching_min_ttl = 10
+  },
+
+  {
+    error_code            = 502
+    response_code         = 502
+    response_page_path    = "/errors/502.html"
+    error_caching_min_ttl = 10
+  },
+
+  {
+    error_code            = 503
+    response_code         = 503
+    response_page_path    = "/errors/503.html"
+    error_caching_min_ttl = 10
+  },
+
+  {
+    error_code            = 504
+    response_code         = 504
+    response_page_path    = "/errors/504.html"
+    error_caching_min_ttl = 10
+  }
+]
+```
+
+The module dynamically creates the corresponding CloudFront custom error-response blocks.
+
+If the variable is omitted, the default is:
+
+```hcl
+custom_error_responses = []
+```
+
+Therefore custom error interception is **opt-in**.
+
+---
+
+# Error Response Flow
+
+Consider this request:
+
+```text
+https://example.com/products/123
+```
+
+Because `/products/123` does not match `/static/*`, `/media/*`, or another specialized behavior, it reaches the default application origin:
+
+```text
+User
+ │
+ ▼
+CloudFront
+ │
+ ▼
+ALB
+ │
+ ▼
+Application
+```
+
+Suppose the application returns:
+
+```text
+HTTP 404
+```
+
+The response travels back:
+
+```text
+Application
+    │
+    ▼
+   ALB
+    │
+    │ 404
+    ▼
+CloudFront
+```
+
+CloudFront sees that the configured origin returned an HTTP 404 and checks its custom error-response configuration.
+
+If configured:
+
+```text
+404
+ │
+ └── /errors/404.html
+```
+
+CloudFront retrieves the configured error page from the appropriate origin and returns it to the viewer.
+
+The viewer therefore receives:
+
+```text
+HTTP 404
+```
+
+along with the custom HTML body.
+
+This allows the application to preserve the correct HTTP status while presenting a user-friendly page.
+
+---
+
+# Custom Error Response vs Origin Failover
+
+Custom error responses and CloudFront origin groups are **not the same feature**.
+
+## Custom Error Response
+
+Used when the goal is:
+
+```text
+Origin returns error
+        │
+        ▼
+CloudFront displays custom error page
+```
+
+Example:
+
+```text
+ALB → 404
+        │
+        ▼
+CloudFront
+        │
+        ▼
+S3 /errors/404.html
+```
+
+## Origin Failover
+
+Used when the goal is:
+
+```text
+Primary origin fails
+        │
+        ▼
+CloudFront uses another origin
+```
+
+Example:
+
+```text
+Primary ALB
+    │
+    │ failure
+    ▼
+Failover S3
+```
+
+These features should not be confused.
+
+A custom error page is primarily a **viewer experience mechanism**.
+
+Origin failover is an **origin availability mechanism**.
+
+---
+
+# `/errors/*` Cache Behavior
+
+When custom error pages are stored in an S3 origin that is separate from the application origin, the error-page path must be routed to the origin containing those files.
+
+For the architecture in this module:
+
+```text
+/static/*  → S3
+/media/*   → S3
+/errors/*  → S3
+/*         → ALB
+```
+
+Example:
+
+```hcl
+ordered_cache_behaviors = [
+  {
+    path_pattern     = "/static/*"
+    target_origin_id = "static"
+  },
+
+  {
+    path_pattern     = "/media/*"
+    target_origin_id = "static"
+  },
+
+  {
+    path_pattern     = "/errors/*"
+    target_origin_id = "static"
+  }
+]
+```
+
+The exact cache behavior settings should be selected according to the application's caching requirements.
+
+The important relationship is:
+
+```text
+custom_error_responses
+        │
+        │ response_page_path
+        ▼
+/errors/404.html
+        │
+        ▼
+/errors/* cache behavior
+        │
+        ▼
+S3 origin
+```
+
+---
+
+# Error Page Storage
+
+The CloudFront module **does not create or populate the S3 bucket**.
+
+The caller is responsible for managing the content.
+
+A suitable bucket layout is:
+
+```text
+S3 Bucket
+│
+├── static/
+│   ├── css/
+│   ├── js/
+│   └── images/
+│
+├── media/
+│   └── uploads/
+│
+└── errors/
+    ├── 404.html
+    ├── 500.html
+    ├── 502.html
+    ├── 503.html
+    └── 504.html
+```
+
+The folders do not need to be manually created as empty S3 directories.
+
+For example, uploading:
+
+```text
+errors/404.html
+```
+
+creates the `errors/` prefix automatically.
+
+---
+
+# Error Caching
+
+CloudFront can cache custom error responses.
+
+The module therefore exposes:
+
+```hcl
+error_caching_min_ttl
+```
+
+Example:
+
+```hcl
+{
+  error_code            = 503
+  response_code         = 503
+  response_page_path    = "/errors/503.html"
+  error_caching_min_ttl = 10
+}
+```
+
+Short TTLs are generally more appropriate for transient application errors such as:
+
+```text
+500
+502
+503
+504
+```
+
+because the application may recover shortly after the error occurs.
+
+A longer TTL can be appropriate for persistent client errors such as:
+
+```text
+404
+```
+
+depending on the application.
+
+Example strategy:
+
+```text
+404 → 60 seconds
+500 → 10 seconds
+502 → 10 seconds
+503 → 10 seconds
+504 → 10 seconds
+```
+
+These values are examples rather than mandatory recommendations.
+
+---
+
+# Preserving the HTTP Status Code
+
+The module allows the response status code to be configured independently.
+
+For example:
+
+```hcl
+{
+  error_code         = 404
+  response_code      = 404
+  response_page_path = "/errors/404.html"
+}
+```
+
+The viewer receives:
+
+```text
+HTTP 404
+```
+
+while seeing the custom error page.
+
+This is generally preferable to converting an actual error into:
+
+```text
+HTTP 200
+```
+
+because clients, search engines, monitoring systems, and other consumers can still correctly identify the request as unsuccessful.
+
+---
+
+# Dead Subdomains and CloudFront Errors
+
+CloudFront can provide a custom error page when a request reaches the distribution and the configured origin returns an applicable error.
+
+However, CloudFront cannot intercept a hostname that never reaches CloudFront.
+
+For example:
+
+```text
+dead.example.com
+```
+
+If DNS does not resolve the hostname:
+
+```text
+User
+ │
+ ▼
+DNS
+ │
+ └── No DNS record
+       │
+       ▼
+     Failure
+```
+
+CloudFront is never involved.
+
+For a hostname to reach CloudFront, DNS must route it appropriately and the hostname must be configured for the distribution.
+
+Therefore:
+
+> A "dead subdomain" is only handled by CloudFront if the request actually reaches the CloudFront distribution and produces an error that CloudFront is configured to handle.
 
 ---
 
@@ -446,7 +1123,7 @@ This is one of the main reasons the module uses a map for `origins` and a list f
 
 The default cache behavior is mandatory because CloudFront requires a default behavior.
 
-Example:
+For an application-backed distribution:
 
 ```hcl
 default_cache_behavior = {
@@ -456,7 +1133,11 @@ default_cache_behavior = {
   allowed_methods = [
     "GET",
     "HEAD",
-    "OPTIONS"
+    "OPTIONS",
+    "POST",
+    "PUT",
+    "PATCH",
+    "DELETE"
   ]
 
   cached_methods = [
@@ -468,7 +1149,7 @@ default_cache_behavior = {
 }
 ```
 
-The default cache policy is AWS-managed `CachingOptimized` unless another cache policy ID is supplied.
+The default behavior handles all requests not matched by an ordered cache behavior.
 
 ---
 
@@ -486,34 +1167,29 @@ ordered_cache_behaviors = [
   },
 
   {
-    path_pattern     = "/api/*"
-    target_origin_id = "application"
+    path_pattern     = "/media/*"
+    target_origin_id = "static"
+  },
 
-    allowed_methods = [
-      "GET",
-      "HEAD",
-      "OPTIONS",
-      "POST",
-      "PUT",
-      "PATCH",
-      "DELETE"
-    ]
-
-    cached_methods = [
-      "GET",
-      "HEAD"
-    ]
+  {
+    path_pattern     = "/errors/*"
+    target_origin_id = "static"
   }
 ]
 ```
 
-This creates logical routing such as:
+The resulting routing is:
 
 ```text
 /static/*  → S3
-/api/*     → Application ALB
-/*         → Application ALB
+/media/*   → S3
+/errors/*  → S3
+/*         → ALB
 ```
+
+CloudFront evaluates ordered behaviors according to their configured order.
+
+The caller should therefore keep behavior ordering deliberate.
 
 ---
 
@@ -562,20 +1238,20 @@ Multiple origins are normally used for routing:
 
 ```text
 /static/* → S3
-/api/*    → ALB
+/*        → ALB
 ```
 
 Origin groups are used for failover:
 
 ```text
-              Origin Group
-                  │
-          ┌───────┴───────┐
-          │               │
-       Primary         Failover
-          │               │
-          ▼               ▼
-         ALB             S3
+               Origin Group
+                   │
+           ┌───────┴───────┐
+           │               │
+        Primary         Failover
+           │               │
+           ▼               ▼
+          ALB             S3
 ```
 
 Example:
@@ -600,7 +1276,7 @@ The primary origin is used first.
 
 If CloudFront receives one of the configured failover status codes, it can use the failover origin.
 
-Origin groups should therefore not be confused with ordinary multi-origin routing.
+Origin groups should therefore not be confused with custom error responses.
 
 ---
 
@@ -612,8 +1288,8 @@ Example:
 
 ```hcl
 aliases = [
-  "www.example.com",
-  "example.com"
+  "example.com",
+  "www.example.com"
 ]
 ```
 
@@ -623,19 +1299,9 @@ When aliases are configured, an ACM certificate must also be supplied:
 acm_certificate_arn = var.acm_certificate_arn
 ```
 
-The certificate must satisfy CloudFront's certificate requirements, including being provisioned in the required AWS region for CloudFront.
+The certificate must satisfy CloudFront's certificate requirements.
 
 The module validates the relationship between aliases and the ACM certificate.
-
-This prevents configurations such as:
-
-```hcl
-aliases = [
-  "www.example.com"
-]
-
-acm_certificate_arn = null
-```
 
 ---
 
@@ -802,9 +1468,9 @@ flowchart LR
 
 This architecture separates:
 
-* The CloudFront log producer
-* The delivery configuration
-* The final destination
+* CloudFront log production
+* Delivery configuration
+* Final destination
 
 ---
 
@@ -885,7 +1551,7 @@ logging = {
 
 # Logging Destinations
 
-The module supports these destination types:
+The module supports:
 
 ```text
 s3
@@ -963,7 +1629,7 @@ Defines all CloudFront origins.
 
 At least one origin must be configured.
 
-Each origin contains:
+Each origin contains attributes such as:
 
 ```text
 domain_name
@@ -974,7 +1640,7 @@ s3_origin_config
 custom_origin_config
 ```
 
-Supported origin types:
+Supported origin types include:
 
 ```text
 s3
@@ -1005,6 +1671,8 @@ response_headers_policy_id
 compress
 ```
 
+The default behavior should normally point to the application's origin when CloudFront is being used as the front door for a web application.
+
 ---
 
 ## `ordered_cache_behaviors`
@@ -1023,9 +1691,55 @@ ordered_cache_behaviors = [
   {
     path_pattern     = "/static/*"
     target_origin_id = "static"
+  },
+
+  {
+    path_pattern     = "/media/*"
+    target_origin_id = "static"
   }
 ]
 ```
+
+---
+
+## `custom_error_responses`
+
+```text
+Type: list(object)
+Default: []
+```
+
+Defines CloudFront custom error responses.
+
+Each object can configure:
+
+```text
+error_code
+response_code
+response_page_path
+error_caching_min_ttl
+```
+
+Example:
+
+```hcl
+custom_error_responses = [
+  {
+    error_code            = 404
+    response_code         = 404
+    response_page_path    = "/errors/404.html"
+    error_caching_min_ttl = 60
+  }
+]
+```
+
+The default:
+
+```hcl
+custom_error_responses = []
+```
+
+means no custom CloudFront error responses are configured.
 
 ---
 
@@ -1154,7 +1868,7 @@ Type: string
 Default: "TLSv1.2_2021"
 ```
 
-Minimum TLS security policy for the viewer connection.
+Minimum TLS security policy for viewer connections.
 
 ---
 
@@ -1210,7 +1924,7 @@ Additional tags applied to the CloudFront distribution and supported logging res
 
 The module intentionally performs validation at several levels.
 
-## Input validation
+## Input Validation
 
 Simple constraints are validated directly inside `variables.tf`.
 
@@ -1227,6 +1941,9 @@ Examples include:
 * Non-empty domains
 * Unique aliases
 * Valid failover status codes
+* Valid custom error configuration
+* Non-negative error caching TTLs
+* Valid error-page paths
 
 ---
 
@@ -1236,9 +1953,7 @@ Some relationships cannot be safely validated by examining one variable independ
 
 These are handled through Terraform lifecycle preconditions.
 
-Examples include:
-
-### Cache behavior → origin
+## Cache Behavior → Origin
 
 ```text
 target_origin_id
@@ -1250,7 +1965,7 @@ must exist in
 origins
 ```
 
-### Origin group → origins
+## Origin Group → Origins
 
 ```text
 primary_origin_id
@@ -1259,6 +1974,8 @@ primary_origin_id
 must exist in origins
 ```
 
+and:
+
 ```text
 failover_origin_id
         │
@@ -1266,7 +1983,7 @@ failover_origin_id
 must exist in origins
 ```
 
-### Alias → ACM certificate
+## Alias → ACM Certificate
 
 ```text
 aliases != []
@@ -1274,6 +1991,16 @@ aliases != []
        ▼
 ACM certificate required
 ```
+
+## Custom Error Page → Origin Routing
+
+When a custom error response references:
+
+```text
+/errors/404.html
+```
+
+the distribution must have an appropriate origin/cache-behavior configuration capable of retrieving that object.
 
 This layered approach keeps validation comprehensive without attempting to reproduce AWS's entire API validation system inside Terraform.
 
@@ -1369,33 +2096,44 @@ Returns `null` when logging is disabled.
 
 The `examples/complete` directory demonstrates a realistic multi-origin deployment.
 
-The architecture is:
+The intended production-style architecture is:
 
 ```text
-                         Internet
-                            │
-                            ▼
-                     ┌──────────────┐
-                     │  CloudFront  │
-                     └──────┬───────┘
-                            │
-             ┌──────────────┼──────────────┐
-             │              │              │
-             ▼              ▼              ▼
-        /static/*        /api/*            /*
-             │              │              │
-             ▼              ▼              ▼
-            S3             ALB             ALB
-             │
-             ▼
-            OAC
+                              Internet
+                                  │
+                                  ▼
+                         ┌─────────────────┐
+                         │   CloudFront    │
+                         └────────┬────────┘
+                                  │
+             ┌────────────────────┼────────────────────┐
+             │                    │                    │
+             ▼                    ▼                    ▼
+        /static/*             /media/*             /*
+             │                    │                    │
+             ▼                    ▼                    ▼
+             S3                   S3                  ALB
+             │                    │                    │
+             └──────────┬─────────┘                    ▼
+                        │                         Application
+                        │
+                        ▼
+                       OAC
+
+                    Error Responses
+                          │
+                          ▼
+                    /errors/*.html
+                          │
+                          ▼
+                         S3
 
 CloudFront
-    │
-    ▼
+     │
+     ▼
 Standard Logging v2
-    │
-    └──► S3 / CloudWatch Logs / Firehose
+     │
+     └──► S3 / CloudWatch Logs / Firehose
 ```
 
 The complete example is intended to demonstrate the module's configuration rather than create every dependency required by the distribution.
@@ -1430,6 +2168,37 @@ Private S3 Bucket
 ```
 
 The S3 bucket should not need public read access.
+
+---
+
+# Static, Media, and Error Content Security
+
+The same private S3 origin can hold:
+
+```text
+static/
+media/
+errors/
+```
+
+CloudFront can expose these objects while keeping the underlying S3 bucket private.
+
+For example:
+
+```text
+User
+ │
+ ▼
+CloudFront
+ │
+ ├── /static/* → OAC → S3
+ │
+ ├── /media/*  → OAC → S3
+ │
+ └── /errors/* → OAC → S3
+```
+
+The application therefore does not need to expose the S3 bucket directly.
 
 ---
 
@@ -1492,6 +2261,47 @@ This prevents unencrypted traffic between CloudFront and the origin.
 
 ---
 
+# Application Origin Security
+
+The application ALB should ideally not be treated as the primary public entry point when CloudFront is intended to provide the public edge layer.
+
+A common architecture is:
+
+```text
+Internet
+   │
+   ▼
+CloudFront
+   │
+   ▼
+ALB
+   │
+   ▼
+Private Application Subnets
+```
+
+Security groups and network controls should be configured separately so that the ALB and application infrastructure are protected according to the broader infrastructure design.
+
+---
+
+# Error Page Security
+
+Custom error pages should be treated as static public-facing content.
+
+They should not contain:
+
+* Stack traces
+* Database errors
+* Internal hostnames
+* Credentials
+* Infrastructure details
+* Sensitive application information
+* Debug output
+
+A good error page should provide a useful user experience without exposing implementation details.
+
+---
+
 # Cost Considerations
 
 CloudFront costs depend on several factors, including:
@@ -1530,13 +2340,58 @@ Logging should therefore be enabled deliberately, especially for high-volume dis
 
 # Operational Considerations
 
-## CloudFront deployments are asynchronous
+## CloudFront Deployments Are Asynchronous
 
 CloudFront distribution changes are not instantaneous.
 
 After Terraform applies a configuration change, AWS may take time to propagate the distribution globally.
 
 The Terraform resource remains under AWS control during this deployment process.
+
+---
+
+# Error Page Deployment
+
+Custom error responses depend on the referenced error-page objects being available.
+
+For example:
+
+```text
+custom_error_responses
+        │
+        ▼
+/errors/503.html
+        │
+        ▼
+S3 object
+```
+
+The CloudFront module does not create the HTML files.
+
+The application/infrastructure deployment process should ensure that the expected objects exist.
+
+---
+
+# Application Recovery and Error Caching
+
+When using custom error pages for transient errors, keep the error caching TTL appropriate for the application's recovery characteristics.
+
+For example:
+
+```text
+Application unavailable
+        │
+        ▼
+ALB returns 503
+        │
+        ▼
+CloudFront serves custom 503
+        │
+        ▼
+503 cached for configured TTL
+```
+
+A short TTL can reduce the period during which users continue to see an error page after the application has recovered.
 
 ---
 
@@ -1560,7 +2415,7 @@ Logging v2 should primarily be considered an access-log delivery mechanism.
 
 # Module Design Decisions
 
-## Why does the module not create S3 buckets?
+## Why Does the Module Not Create S3 Buckets?
 
 Because an S3 bucket can have a lifecycle completely independent from CloudFront.
 
@@ -1570,12 +2425,31 @@ A bucket may already be used by:
 * An application
 * Backup infrastructure
 * Data-processing workloads
+* Static assets
+* Media files
+* Error pages
 
 Creating it inside this module would create unnecessary coupling.
 
 ---
 
-# Why does the module not create ACM certificates?
+# Why Does the Module Not Create Static or Error Files?
+
+The CloudFront module manages CDN infrastructure, not application content.
+
+The caller owns objects such as:
+
+```text
+static/*
+media/*
+errors/*
+```
+
+This allows application deployment systems to update content independently of CloudFront infrastructure.
+
+---
+
+# Why Does the Module Not Create ACM Certificates?
 
 ACM certificates have their own lifecycle and validation requirements.
 
@@ -1594,7 +2468,7 @@ CloudFront Module
 
 ---
 
-# Why does the module not create WAF Web ACLs?
+# Why Does the Module Not Create WAF Web ACLs?
 
 WAF policies are security resources with independent lifecycle and governance requirements.
 
@@ -1607,7 +2481,7 @@ Keeping them outside the CloudFront module allows:
 
 ---
 
-# Why is `origins` a map?
+# Why Is `origins` a Map?
 
 Using:
 
@@ -1626,17 +2500,13 @@ Cache behaviors can reference:
 target_origin_id = "static"
 ```
 
-rather than:
-
-```hcl
-target_origin_id = origins[0]
-```
+rather than positional indexes.
 
 This makes configurations easier to read and less sensitive to ordering changes.
 
 ---
 
-# Why are ordered behaviors a list?
+# Why Are Ordered Behaviors a List?
 
 CloudFront evaluates ordered cache behaviors in a defined order.
 
@@ -1658,11 +2528,31 @@ ordered_cache_behaviors = [
 ]
 ```
 
-The ordering can be significant and should therefore remain explicit in the caller's configuration.
+The ordering should therefore remain explicit in the caller's configuration.
 
 ---
 
-# Why does the module use Standard Logging v2?
+# Why Are Custom Error Responses Optional?
+
+Not every CloudFront distribution needs custom error pages.
+
+Some distributions may simply pass origin errors to viewers.
+
+Therefore the module uses:
+
+```hcl
+custom_error_responses = []
+```
+
+as the default.
+
+Applications can opt into the feature when required.
+
+This preserves the generic nature of the module.
+
+---
+
+# Why Does the Module Use Standard Logging v2?
 
 The module intentionally avoids the legacy CloudFront logging configuration.
 
@@ -1672,89 +2562,12 @@ The module therefore models logging as a separate delivery pipeline rather than 
 
 ---
 
-# Deployment Workflow
-
-From the module root:
-
-```powershell
-terraform fmt -recursive
-```
-
-Then:
-
-```powershell
-terraform init
-```
-
-Validate the configuration:
-
-```powershell
-terraform validate
-```
-
-Review the planned changes:
-
-```powershell
-terraform plan
-```
-
-Apply:
-
-```powershell
-terraform apply
-```
-
----
-
-# Recommended Git Workflow
-
-After validating the module:
-
-```powershell
-git status
-```
-
-Review the changes:
-
-```powershell
-git diff
-```
-
-Stage the module:
-
-```powershell
-git add .
-```
-
-Commit:
-
-```powershell
-git commit -m "feat: add cloudfront module"
-```
-
-Create the initial version tag:
-
-```powershell
-git tag -a v1.0.0 -m "Release CloudFront module v1.0.0"
-```
-
-Push the branch:
-
-```powershell
-git push origin main
-```
-
-Push the tag:
-
-```powershell
-git push origin v1.0.0
-```
 
 The module can then be consumed by another Terraform project using:
 
 ```hcl
 module "cloudfront" {
-  source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.0.0"
+  source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.1.0"
 
   ...
 }
@@ -1786,7 +2599,7 @@ Do not import resources blindly.
 
 # Troubleshooting
 
-## `target_origin_id` does not exist
+## `target_origin_id` Does Not Exist
 
 If Terraform reports that a cache behavior references an unknown origin, check:
 
@@ -1810,7 +2623,7 @@ The identifiers must match exactly.
 
 ---
 
-## Alias configured without ACM certificate
+# Alias Configured Without ACM Certificate
 
 If:
 
@@ -1832,7 +2645,7 @@ Provide the appropriate ACM certificate.
 
 ---
 
-## S3 origin configuration errors
+# S3 Origin Configuration Errors
 
 An S3 origin must use:
 
@@ -1846,7 +2659,7 @@ For private S3 origins, configure an Origin Access Control.
 
 ---
 
-## Custom origin configuration errors
+# Custom Origin Configuration Errors
 
 A custom origin must use:
 
@@ -1862,11 +2675,94 @@ custom_origin_config = {
 }
 ```
 
-Do not combine S3 and custom origin configuration for the same origin.
+Do not combine S3 and custom-origin configuration for the same origin.
 
 ---
 
-## Logging destination errors
+# Custom Error Page Not Found
+
+If CloudFront is configured with:
+
+```hcl
+response_page_path = "/errors/404.html"
+```
+
+verify that:
+
+```text
+errors/404.html
+```
+
+actually exists in the intended S3 origin.
+
+Also verify that the distribution contains an appropriate cache behavior capable of routing:
+
+```text
+/errors/*
+```
+
+to that S3 origin.
+
+---
+
+# Custom Error Response Not Triggering
+
+If a custom error page is not being returned:
+
+1. Confirm the origin actually returns the configured error code.
+2. Confirm the error code is configured in `custom_error_responses`.
+3. Confirm `response_page_path` is correct.
+4. Confirm the error page exists in S3.
+5. Confirm `/errors/*` routes to the S3 origin.
+6. Confirm CloudFront can access the private S3 object through OAC.
+7. Check whether the response is currently cached.
+8. Review CloudFront logs and application/ALB logs.
+
+---
+
+# Static or Media Requests Reaching the ALB
+
+If:
+
+```text
+/static/*
+```
+
+or:
+
+```text
+/media/*
+```
+
+reaches the ALB instead of S3, verify:
+
+```hcl
+ordered_cache_behaviors = [
+  {
+    path_pattern     = "/static/*"
+    target_origin_id = "static"
+  },
+
+  {
+    path_pattern     = "/media/*"
+    target_origin_id = "static"
+  }
+]
+```
+
+Also verify that:
+
+```hcl
+default_cache_behavior = {
+  target_origin_id = "application"
+}
+```
+
+is not being incorrectly used for those paths because the ordered behaviors are missing or incorrectly configured.
+
+---
+
+# Logging Destination Errors
 
 When Standard Logging v2 is enabled, verify:
 
@@ -1880,7 +2776,7 @@ When Standard Logging v2 is enabled, verify:
 
 # Recommended Production Pattern
 
-For a typical public web application, the recommended architecture is:
+For a typical public Django/web application, the recommended architecture is:
 
 ```mermaid
 flowchart TB
@@ -1891,32 +2787,67 @@ flowchart TB
 
     CF["CloudFront"]
 
-    STATIC["S3<br/>Private Static Assets"]
-
-    OAC["Origin Access Control"]
+    S3["Private S3 Bucket"]
+    OAC["CloudFront Origin Access Control"]
 
     ALB["Application Load Balancer"]
 
     APP["Private Application Subnets"]
 
     LOG["Standard Logging v2"]
-
     S3LOG["S3 Log Archive"]
 
     USER --> WAF
     WAF --> CF
 
     CF -->|/static/*| OAC
-    OAC --> STATIC
+    CF -->|/media/*| OAC
+    CF -->|/errors/*| OAC
 
-    CF -->|/api/*| ALB
-    CF -->|/*| ALB
+    OAC --> S3
+
+    CF -->|Everything Else| ALB
 
     ALB --> APP
+
+    APP -->|4xx / 5xx| ALB
+    ALB -->|Error Response| CF
+    CF -->|Custom Error Page| S3
 
     CF --> LOG
     LOG --> S3LOG
 ```
+
+The resulting behavior is:
+
+```text
+/static/*  → S3
+/media/*   → S3
+/errors/*  → S3
+/*         → ALB
+```
+
+Application errors can then be transformed into user-friendly error pages:
+
+```text
+ALB → 404 → CloudFront → S3 /errors/404.html
+ALB → 500 → CloudFront → S3 /errors/500.html
+ALB → 502 → CloudFront → S3 /errors/502.html
+ALB → 503 → CloudFront → S3 /errors/503.html
+ALB → 504 → CloudFront → S3 /errors/504.html
+```
+
+The HTTP status can remain:
+
+```text
+404
+500
+502
+503
+504
+```
+
+while the response body comes from the custom HTML page.
 
 This provides:
 
@@ -1925,7 +2856,11 @@ This provides:
 * Centralized public entry point
 * WAF protection
 * Private S3 content
+* Static asset offloading
+* Media asset offloading
 * Application routing through an ALB
+* Custom application error pages
+* Separation between application availability and error-page availability
 * Path-based origin selection
 * Centralized access logging
 * Separation between public and private infrastructure
@@ -1943,6 +2878,7 @@ CloudFront Distribution
         │
         ├── Origins configuration
         ├── Cache behaviors
+        ├── Custom error responses
         ├── Viewer configuration
         ├── Origin groups
         ├── WAF association
@@ -1962,9 +2898,45 @@ Origin request policies
 Response headers policies
 Route 53 records
 Logging destinations
+Application content
+Static files
+Media files
+Custom error pages
 ```
 
 This separation keeps resource lifecycles independent and makes the module suitable for reuse across multiple environments and applications.
+
+---
+
+# Application Content Ownership
+
+The CloudFront module does not own application content.
+
+For example:
+
+```text
+Django deployment
+       │
+       ├── collectstatic
+       │       │
+       │       ▼
+       │     S3/static/
+       │
+       └── media uploads
+               │
+               ▼
+             S3/media/
+```
+
+The infrastructure deployment can independently maintain:
+
+```text
+S3/static/*
+S3/media/*
+S3/errors/*
+```
+
+CloudFront simply provides the delivery layer.
 
 ---
 
@@ -1975,7 +2947,7 @@ This module follows semantic versioning.
 Example:
 
 ```text
-v1.0.0
+v1.1.0
 ```
 
 Terraform consumers should reference a release tag rather than an unpinned branch.
@@ -1983,12 +2955,20 @@ Terraform consumers should reference a release tag rather than an unpinned branc
 Example:
 
 ```hcl
-source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.0.0"
+source = "git::https://github.com/iamwonodi/terraform-aws-cloudfront.git?ref=v1.1.0"
 ```
 
 Future backward-compatible changes should increment the minor version.
 
 Breaking changes should increment the major version.
+
+A new optional capability such as custom error responses can be introduced without forcing existing consumers to configure it because:
+
+```hcl
+custom_error_responses = []
+```
+
+remains the default behavior.
 
 ---
 
