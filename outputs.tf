@@ -28,6 +28,26 @@ output "status" {
 }
 
 ################################################################################
+# S3 ORIGIN ACCESS CONTROL OUTPUTS
+################################################################################
+
+output "s3_origin_access_control_id" {
+  description = "ID of the CloudFront Origin Access Control created by this module for S3 origins."
+  value = try(
+    aws_cloudfront_origin_access_control.s3[0].id,
+    null
+  )
+}
+
+output "s3_origin_access_control_arn" {
+  description = "ARN of the CloudFront Origin Access Control created by this module for S3 origins."
+  value = try(
+    aws_cloudfront_origin_access_control.s3[0].arn,
+    null
+  )
+}
+
+################################################################################
 # STANDARD LOGGING V2 OUTPUTS
 ################################################################################
 

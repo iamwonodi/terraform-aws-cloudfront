@@ -1,14 +1,55 @@
 ################################################################################
+# S3 ORIGIN ACCESS CONTROL
+################################################################################
+
+# ------------------------------------------------------------------------------
+# CloudFront Origin Access Control
+#
+# When enabled, the module creates a single OAC and automatically attaches it
+# to every S3 origin in the distribution.
+#
+# The OAC signs CloudFront-to-S3 requests using SigV4. The S3 bucket policy
+# remains caller-managed because the bucket policy must authorize the specific
+# CloudFront distribution ARN.
+# ------------------------------------------------------------------------------
+
+resource "aws_cloudfront_origin_access_control" "s3" {
+  count = (
+    var.create_s3_origin_access_control &&
+    anytrue([
+      for origin in values(var.origins) :
+      origin.origin_type == "s3"
+    ])
+  ) ? 1 : 0
+
+  name = substr(
+    "${var.project_name}-${var.environment}-s3-oac",
+    0,
+    64
+  )
+
+  description = "Origin Access Control for ${var.project_name}-${var.environment} S3 origins"
+
+  origin_access_control_origin_type = "s3"
+  signing_behavior                  = "always"
+  signing_protocol                  = "sigv4"
+}
+
+
+################################################################################
 # CLOUDFRONT DISTRIBUTION
 ################################################################################
 
 # ------------------------------------------------------------------------------
 # CloudFront distribution
 #
-# The distribution is intentionally the only AWS resource owned by this
-# module. Origins, ACM certificates, WAF policies, Route 53 records, cache
-# policies, and response-header policies have independent lifecycles and are
-# therefore supplied by the caller.
+# The distribution & cloudwatch log resource are intentionally the only AWS
+# resources owned by this module, with the exception of the optional S3 Origin
+# Access Control above.
+#
+# Origins, ACM certificates, WAF policies, Route 53 records, cache policies,
+# and response-header policies have independent lifecycles and are therefore
+# supplied by the caller.
 #
 # Multiple origins are supported so a single distribution can route different
 # URL paths to different backends, such as S3 for static content and an ALB for
@@ -93,7 +134,16 @@ resource "aws_cloudfront_distribution" "this" {
       origin_id   = origin.key
       origin_path = origin.value.origin_path
 
-      origin_access_control_id = origin.value.origin_access_control_id
+      # -----------------------------------------------------------------------
+      # Automatically use the module-created OAC for S3 origins when enabled.
+      #
+      # If automatic OAC creation is disabled, an externally supplied
+      # origin_access_control_id can still be used.
+      # -----------------------------------------------------------------------
+      origin_access_control_id = (
+        origin.value.origin_type == "s3" &&
+        var.create_s3_origin_access_control
+      ) ? aws_cloudfront_origin_access_control.s3[0].id : origin.value.origin_access_control_id
 
       dynamic "s3_origin_config" {
         for_each = origin.value.origin_type == "s3" ? [origin.value.s3_origin_config] : []

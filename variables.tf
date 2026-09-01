@@ -34,6 +34,16 @@ variable "comment" {
   }
 }
 
+################################################################################
+# S3 ORIGIN ACCESS CONTROL
+################################################################################
+
+variable "create_s3_origin_access_control" {
+  type        = bool
+  description = "Whether the module should create and automatically attach a CloudFront Origin Access Control to all S3 origins."
+  default     = false
+}
+
 variable "origins" {
   type = map(object({
     domain_name = string
@@ -98,6 +108,7 @@ variable "origins" {
     condition = alltrue([
       for origin in values(var.origins) :
       origin.origin_type != "s3" || (
+        var.create_s3_origin_access_control ||
         origin.origin_access_control_id != null ||
         (
           origin.s3_origin_config != null &&
@@ -106,7 +117,31 @@ variable "origins" {
       )
     ])
 
-    error_message = "Each S3 origin must define either origin_access_control_id or s3_origin_config.origin_access_identity."
+    error_message = "Each S3 origin must use the module-created OAC, an externally supplied origin_access_control_id, or an origin access identity."
+  }
+
+  validation {
+    condition = !var.create_s3_origin_access_control || alltrue([
+      for origin in values(var.origins) :
+      origin.origin_type != "s3" ||
+      origin.origin_access_control_id == null
+    ])
+
+    error_message = "origin_access_control_id must not be supplied for S3 origins when create_s3_origin_access_control is enabled."
+  }
+
+
+  validation {
+    condition = !var.create_s3_origin_access_control || alltrue([
+      for origin in values(var.origins) :
+      origin.origin_type != "s3" ||
+      (
+        origin.s3_origin_config != null &&
+        trimspace(origin.s3_origin_config.origin_access_identity) == ""
+      )
+    ])
+
+    error_message = "S3 origins using automatic OAC creation must not define an Origin Access Identity."
   }
 
   validation {
